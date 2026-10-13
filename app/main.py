@@ -31,11 +31,15 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0) # replace() will cause wrong timezone -> it only changes the UTC value and not convert it to the right IST
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+def compute_late_minutes(punch_in: datetime, shift_start: str, date_str: str) -> int:
+    h, m = map(int, shift_start.split(':'))
+    shift_start_dt = datetime.fromisoformat(date_str).replace(hour=h, minute=m, second=0, microsecond=0, tzinfo=IST)
+    if punch_in.tzinfo is None:
+        punch_in = punch_in.replace(tzinfo=timezone.utc)
+    delta_seconds = (punch_in - shift_start_dt).total_seconds()
+    if delta_seconds > 600:
+        return int(delta_seconds // 60)
+    return 0
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
@@ -43,10 +47,26 @@ def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
     return round_half_up(seconds / 3600, 2)
 
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+def compute_overtime(punch_out: datetime, shift_start: str, shift_end: str, date_str: str) -> int:
+    h_end, m_end = map(int, shift_end.split(":"))
+    end_date = datetime.fromisoformat(date_str).date()
+    
+    # R1: For overnight shifts, shift_end is on the NEXT calendar day
+    if shift_end <= shift_start:
+        end_date += timedelta(days=1)
+        
+    shift_end_dt = datetime(end_date.year, end_date.month, end_date.day, h_end, m_end, 0, tzinfo=IST)
+    
+    # Ensure punch_out is timezone-aware
+    if punch_out.tzinfo is None:
+        punch_out = punch_out.replace(tzinfo=timezone.utc)
+        
+    delta_seconds = (punch_out - shift_end_dt).total_seconds()
+    
+    # R3: Counted only if at least 30 minutes (1800 seconds); otherwise 0
+    if delta_seconds >= 30 * 60:
+        return int(delta_seconds // 60)
+    return 0
 
 def ms_to_datetime(ms: int) -> datetime:
     truncated_ms = (ms // 1000) * 1000
