@@ -16,10 +16,11 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
+from decimal import Decimal, ROUND_HALF_UP # for decial roundup and avoid banker's decimal
 
 load_dotenv()
 
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"),tz_aware=True)# added the timezone aware for the system.
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -32,13 +33,14 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 # --------------------------------------------------------------------------- #
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
     h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
+    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0) # replace() will cause wrong timezone -> it only changes the UTC value and not convert it to the right IST
     minutes = int((punch_in - start).total_seconds() / 60)
     return minutes if minutes > 10 else 0
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
+    seconds = (punch_out - punch_in).total_seconds()
+    return round_half_up(seconds / 3600, 2)
 
 
 def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
@@ -46,6 +48,21 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
     end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
     return max(0, int((punch_out - end).total_seconds() / 60))
 
+def ms_to_datetime(ms: int) -> datetime:
+    truncated_ms = (ms // 1000) * 1000
+    return datetime.fromtimestamp(truncated_ms / 1000, tz=timezone.utc)
+
+def datetime_to_ms(dt: Optional[datetime]) -> Optional[int]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+def round_half_up(val: float, decimals: int = 2) -> float: # roundup and not banker's decimal
+    d = Decimal(str(val))
+    q = Decimal("10") ** -decimals
+    return float(d.quantize(q, rounding=ROUND_HALF_UP))
 
 # --------------------------------------------------------------------------- #
 # Models
