@@ -32,6 +32,8 @@ IST = timezone(timedelta(hours=5, minutes=30))
 def init_db():
     # employees: unique emp_code
     db.employees.create_index("emp_code", unique=True)
+    db.employees.create_index("department")
+    db.employees.create_index("joined_on")
     db.employees.create_index([("department", 1), ("joined_on", 1)])
     # attendance_logs: unique (emp_code, date)
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
@@ -1042,7 +1044,290 @@ def department_trend(
     return {"department": department, "items": items}
 
 
-# --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   GET   /admin/explain/{endpoint}
-# --------------------------------------------------------------------------- #
+@app.get("/admin/explain/{endpoint}", status_code=200)
+def explain_endpoint(
+    endpoint: Literal[
+        "attendance_list",
+        "employee_monthly",
+        "department_summary",
+        "late_leaderboard",
+        "department_trend",
+    ],
+    emp_code: Optional[str] = None,
+    month: Optional[str] = None,
+    department: Optional[str] = None,
+    limit: int = 10,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[str] = None,
+    from_date: Optional[str] = Query(None, alias="from"),
+    to_date: Optional[str] = Query(None, alias="to"),
+    page: int = 1,
+    page_size: int = 20,
+):
+    if endpoint == "attendance_list":
+        if page < 1:
+            raise HTTPException(status_code=422, detail="page must be >= 1")
+        if page_size < 1 or page_size > 100:
+            raise HTTPException(status_code=422, detail="page_size must be between 1 and 100")
+
+        date_regex = re.compile(r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
+        if date_from and not date_regex.match(date_from):
+            raise HTTPException(status_code=422, detail="Invalid date_from format")
+        if date_to and not date_regex.match(date_to):
+            raise HTTPException(status_code=422, detail="Invalid date_to format")
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(status_code=422, detail="date_from must be <= date_to")
+
+        q: Dict[str, Any] = {}
+        if emp_code:
+            q["emp_code"] = emp_code
+        if date_from or date_to:
+            q["date"] = {}
+            if date_from:
+                q["date"]["$gte"] = date_from
+            if date_to:
+                q["date"]["$lte"] = date_to
+        if status:
+            valid_statuses = {"PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"}
+            if status not in valid_statuses:
+                raise HTTPException(status_code=422, detail=f"Invalid status: {status}")
+            q["status"] = status
+
+        skip = (page - 1) * page_size
+        cmd = {
+            "explain": {
+                "find": "attendance_logs",
+                "filter": q,
+                "sort": {"date": -1, "emp_code": 1},
+                "skip": skip,
+                "limit": page_size,
+            },
+            "verbosity": "executionStats",
+        }
+        exp = db.command(cmd)
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": exp,
+        }
+
+    elif endpoint == "employee_monthly":
+        if not emp_code:
+            raise HTTPException(status_code=422, detail="emp_code is required")
+        if not month or not re.match(r"^\d{4}-(0[1-9]|1[0-2])$", month):
+            raise HTTPException(status_code=422, detail="Invalid month format")
+
+        year, m_num = map(int, month.split("-"))
+        _, last_day = calendar.monthrange(year, m_num)
+        start_date = f"{year:04d}-{m_num:02d}-01"
+        end_date = f"{year:04d}-{m_num:02d}-{last_day:02d}"
+
+        pipeline = [
+            {
+                "$match": {
+                    "emp_code": emp_code,
+                    "date": {"$gte": start_date, "$lte": end_date},
+                }
+            },
+            {
+                "$group": {
+                    "_id": None,
+                    "present_days": {
+                        "$sum": {
+                            "$cond": [
+                                {
+                                    "$and": [
+                                        {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                        {"$lte": [{"$isoDayOfWeek": {"$dateFromString": {"dateString": "$date"}}}, 5]},
+                                    ]
+                                },
+                                {"$cond": ["$half_day", 0.5, 1.0]},
+                                0.0,
+                            ]
+                        }
+                    },
+                    "leave_days": {
+                        "$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}
+                    },
+                    "late_count": {
+                        "$sum": {"$cond": [{"$gt": ["$late_minutes", 0]}, 1, 0]}
+                    },
+                    "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+                    "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+                }
+            },
+        ]
+
+        cmd = {
+            "explain": {
+                "aggregate": "attendance_logs",
+                "pipeline": pipeline,
+                "cursor": {},
+            },
+            "verbosity": "executionStats",
+        }
+        exp = db.command(cmd)
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": exp,
+        }
+
+    elif endpoint == "department_summary":
+        if not month or not re.match(r"^\d{4}-(0[1-9]|1[0-2])$", month):
+            raise HTTPException(status_code=422, detail="Invalid month format")
+
+        year, m_num = map(int, month.split("-"))
+        _, last_day = calendar.monthrange(year, m_num)
+        start_date = f"{year:04d}-{m_num:02d}-01"
+        end_date = f"{year:04d}-{m_num:02d}-{last_day:02d}"
+
+        match_stage: Dict[str, Any] = {"joined_on": {"$lte": end_date}}
+        if department is not None:
+            match_stage["department"] = department
+
+        pipeline = [
+            {"$match": match_stage},
+            {
+                "$lookup": {
+                    "from": "attendance_logs",
+                    "let": {"emp": "$emp_code"},
+                    "pipeline": [
+                        {
+                            "$match": {
+                                "$expr": {
+                                    "$and": [
+                                        {"$eq": ["$emp_code", "$$emp"]},
+                                        {"$gte": ["$date", start_date]},
+                                        {"$lte": ["$date", end_date]},
+                                    ]
+                                }
+                            }
+                        }
+                    ],
+                    "as": "logs",
+                }
+            },
+            {
+                "$group": {
+                    "_id": "$department",
+                    "headcount": {"$sum": 1},
+                }
+            },
+        ]
+
+        cmd = {
+            "explain": {
+                "aggregate": "employees",
+                "pipeline": pipeline,
+                "cursor": {},
+            },
+            "verbosity": "executionStats",
+        }
+        exp = db.command(cmd)
+        return {
+            "endpoint": endpoint,
+            "collection": "employees",
+            "explain": exp,
+        }
+
+    elif endpoint == "late_leaderboard":
+        if not month or not re.match(r"^\d{4}-(0[1-9]|1[0-2])$", month):
+            raise HTTPException(status_code=422, detail="Invalid month format")
+        if limit < 1 or limit > 50:
+            raise HTTPException(status_code=422, detail="limit must be between 1 and 50")
+
+        year, m_num = map(int, month.split("-"))
+        _, last_day = calendar.monthrange(year, m_num)
+        start_date = f"{year:04d}-{m_num:02d}-01"
+        end_date = f"{year:04d}-{m_num:02d}-{last_day:02d}"
+
+        pipeline = [
+            {
+                "$match": {
+                    "date": {"$gte": start_date, "$lte": end_date},
+                    "late_minutes": {"$gt": 0},
+                }
+            },
+            {
+                "$group": {
+                    "_id": "$emp_code",
+                    "total_late_minutes": {"$sum": "$late_minutes"},
+                    "late_count": {"$sum": 1},
+                }
+            },
+        ]
+
+        cmd = {
+            "explain": {
+                "aggregate": "attendance_logs",
+                "pipeline": pipeline,
+                "cursor": {},
+            },
+            "verbosity": "executionStats",
+        }
+        exp = db.command(cmd)
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": exp,
+        }
+
+    elif endpoint == "department_trend":
+        if not department:
+            raise HTTPException(status_code=422, detail="department is required")
+        if not from_date or not to_date or not isinstance(from_date, str) or not isinstance(to_date, str):
+            raise HTTPException(status_code=422, detail="from and to are required")
+
+        date_regex = re.compile(r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
+        if not date_regex.match(from_date) or not date_regex.match(to_date):
+            raise HTTPException(status_code=422, detail="Invalid date format")
+
+        try:
+            d_from = date.fromisoformat(from_date)
+            d_to = date.fromisoformat(to_date)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid date format")
+
+        if d_to < d_from:
+            raise HTTPException(status_code=422, detail="to must be >= from")
+        if (d_to - d_from).days + 1 > 92:
+            raise HTTPException(status_code=422, detail="Date range exceeds 92 days")
+
+        dt_from = datetime(d_from.year, d_from.month, d_from.day, tzinfo=timezone.utc)
+        dt_to_exclusive = datetime(d_to.year, d_to.month, d_to.day, tzinfo=timezone.utc) + timedelta(days=1)
+
+        pipeline = [
+            {"$match": {"department": department}},
+            {"$limit": 1},
+            {"$project": {"_id": 0, "date_obj": {"$literal": dt_from}}},
+            {
+                "$densify": {
+                    "field": "date_obj",
+                    "range": {
+                        "step": 1,
+                        "unit": "day",
+                        "bounds": [dt_from, dt_to_exclusive],
+                    },
+                }
+            },
+        ]
+
+        cmd = {
+            "explain": {
+                "aggregate": "employees",
+                "pipeline": pipeline,
+                "cursor": {},
+            },
+            "verbosity": "executionStats",
+        }
+        exp = db.command(cmd)
+        return {
+            "endpoint": endpoint,
+            "collection": "employees",
+            "explain": exp,
+        }
+
+    else:
+        raise HTTPException(status_code=422, detail=f"Unknown endpoint: {endpoint}")
