@@ -16,7 +16,7 @@ from typing import Optional, Literal, Dict, Any, List
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, model_validator
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from decimal import Decimal, ROUND_HALF_UP # for decial roundup and avoid banker's decimal
 from contextlib import asynccontextmanager
@@ -160,6 +160,11 @@ class PunchInIn(BaseModel):
     status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
 
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[int] = Field(default=None, strict=True, ge=100_000_000_000, le=4_102_444_800_000)
+
+
 def serialize_attendance_doc(doc: dict) -> dict:
     doc.pop("_id", None)
     doc.pop("id", None)
@@ -280,6 +285,63 @@ def punch_in(body: PunchInIn):
         raise HTTPException(status_code=409, detail="already punched in for this date")
 
     return serialize_attendance_doc(doc)
+
+
+@app.post("/attendance/punch-out", status_code=200)
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    if body.punched_at is not None:
+        punch_out_dt = ms_to_datetime(body.punched_at)
+    else:
+        now_utc = datetime.now(timezone.utc)
+        punch_out_dt = now_utc.replace(microsecond=0)
+
+    # Find most recent record for the employee
+    candidate = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code},
+        sort=[("punch_in", -1)],
+    )
+    if not candidate:
+        raise HTTPException(status_code=404, detail="No punch-in found")
+
+    punch_in_dt = candidate.get("punch_in")
+    if not punch_in_dt:
+        raise HTTPException(status_code=404, detail="No punch-in found")
+
+    if punch_out_dt <= punch_in_dt:
+        raise HTTPException(status_code=422, detail="punch_out must be after punch_in")
+
+    if (punch_out_dt - punch_in_dt).total_seconds() > 24 * 3600:
+        raise HTTPException(status_code=422, detail="punch_out cannot be more than 24 hours after punch_in")
+
+    if candidate.get("punch_out") is not None:
+        raise HTTPException(status_code=409, detail="That record is already punched out")
+
+    work_hours = compute_work_hours(punch_in_dt, punch_out_dt)
+    overtime_minutes = compute_overtime(
+        punch_out_dt, emp["shift_start"], emp["shift_end"], candidate["date"]
+    )
+    half_day = compute_half_day(work_hours)
+
+    updated = db.attendance_logs.find_one_and_update(
+        {"_id": candidate["_id"], "punch_out": None},
+        {
+            "$set": {
+                "punch_out": punch_out_dt,
+                "work_hours": work_hours,
+                "overtime_minutes": overtime_minutes,
+                "half_day": half_day,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if not updated:
+        raise HTTPException(status_code=409, detail="That record is already punched out")
+
+    return serialize_attendance_doc(updated)
 
 
 @app.get("/attendance")

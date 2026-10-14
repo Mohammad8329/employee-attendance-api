@@ -42,3 +42,5 @@ htmlcov/
 # IDE / Editor folders
 .vscode/
 .idea/
+
+tests/
