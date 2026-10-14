@@ -9,8 +9,9 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
+import re
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Literal, Dict, Any, List
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -155,8 +156,50 @@ class EmployeeIn(BaseModel):
 
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    punched_at: Optional[int] = Field(default=None, strict=True, ge=100_000_000_000, le=4_102_444_800_000)
+    status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
+
+
+def serialize_attendance_doc(doc: dict) -> dict:
+    doc.pop("_id", None)
+    doc.pop("id", None)
+    punch_in = doc.get("punch_in")
+    punch_out = doc.get("punch_out")
+
+    raw_history = doc.get("history") or []
+    clean_history = []
+    for h in raw_history:
+        at_val = h.get("at")
+        at_ms = datetime_to_ms(at_val) if isinstance(at_val, datetime) else at_val
+        clean_changes = {}
+        for k, change in (h.get("changes") or {}).items():
+            from_v = change.get("from")
+            to_v = change.get("to")
+            if k in ("punch_in", "punch_out"):
+                if isinstance(from_v, datetime):
+                    from_v = datetime_to_ms(from_v)
+                if isinstance(to_v, datetime):
+                    to_v = datetime_to_ms(to_v)
+            clean_changes[k] = {"from": from_v, "to": to_v}
+        clean_history.append({
+            "at": at_ms,
+            "by": h.get("by"),
+            "reason": h.get("reason"),
+            "changes": clean_changes,
+        })
+
+    return {
+        "emp_code": doc.get("emp_code"),
+        "date": doc.get("date"),
+        "status": doc.get("status"),
+        "punch_in": datetime_to_ms(punch_in) if isinstance(punch_in, datetime) else punch_in,
+        "punch_out": datetime_to_ms(punch_out) if isinstance(punch_out, datetime) else punch_out,
+        "work_hours": doc.get("work_hours"),
+        "late_minutes": doc.get("late_minutes", 0),
+        "overtime_minutes": doc.get("overtime_minutes", 0),
+        "half_day": doc.get("half_day", False),
+        "history": clean_history,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -206,10 +249,18 @@ def list_employees(
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    if body.punched_at is not None:
+        ts = ms_to_datetime(body.punched_at)
+    else:
+        now_utc = datetime.now(timezone.utc)
+        ts = now_utc.replace(microsecond=0)
+
+    d = determine_attendance_date(ts, emp["shift_start"], emp["shift_end"])
+    late_min = compute_late_minutes(ts, emp["shift_start"], d)
+
     doc = {
         "emp_code": body.emp_code,
         "date": d,
@@ -217,15 +268,18 @@ def punch_in(body: PunchInIn):
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": late_min,
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="already punched in for this date")
+
+    return serialize_attendance_doc(doc)
 
 
 @app.get("/attendance")
@@ -237,7 +291,21 @@ def list_attendance(
     page: int = 1,
     page_size: int = 20,
 ):
-    q = {}
+    if page < 1:
+        raise HTTPException(status_code=422, detail="page must be >= 1")
+    if page_size < 1 or page_size > 100:
+        raise HTTPException(status_code=422, detail="page_size must be between 1 and 100")
+
+    date_regex = re.compile(r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
+    if date_from and not date_regex.match(date_from):
+        raise HTTPException(status_code=422, detail="Invalid date_from format")
+    if date_to and not date_regex.match(date_to):
+        raise HTTPException(status_code=422, detail="Invalid date_to format")
+
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(status_code=422, detail="date_from must be <= date_to")
+
+    q: Dict[str, Any] = {}
     if emp_code:
         q["emp_code"] = emp_code
     if date_from or date_to:
@@ -247,14 +315,17 @@ def list_attendance(
         if date_to:
             q["date"]["$lte"] = date_to
     if status:
+        valid_statuses = {"PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"}
+        if status not in valid_statuses:
+            raise HTTPException(status_code=422, detail=f"Invalid status: {status}")
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+
+    total = db.attendance_logs.count_documents(q)
+    skip = (page - 1) * page_size
+    cursor = db.attendance_logs.find(q).sort([("date", -1), ("emp_code", 1)]).skip(skip).limit(page_size)
+    items = [serialize_attendance_doc(doc) for doc in cursor]
+
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
 # --------------------------------------------------------------------------- #
