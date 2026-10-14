@@ -84,6 +84,20 @@ def round_half_up(val: float, decimals: int = 2) -> float: # roundup and not ban
     q = Decimal("10") ** -decimals
     return float(d.quantize(q, rounding=ROUND_HALF_UP))
 
+def determine_attendance_date(punch_in_dt: datetime, shift_start: str, shift_end: str) -> str:
+    punch_in_ist = punch_in_dt.astimezone(IST)
+    if shift_end <= shift_start:
+        end_h, end_m = map(int, shift_end.split(":"))
+        t = punch_in_ist.time()
+        if (t.hour, t.minute, t.second) < (end_h, end_m, 0):
+            return (punch_in_ist.date() - timedelta(days=1)).isoformat()
+    return punch_in_ist.date().isoformat()
+
+
+def compute_half_day(work_hours: Optional[float]) -> bool:
+    if work_hours is None:
+        return False
+    return work_hours < 4.50
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
