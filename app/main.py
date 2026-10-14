@@ -14,8 +14,9 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
 from decimal import Decimal, ROUND_HALF_UP # for decial roundup and avoid banker's decimal
 from contextlib import asynccontextmanager
 
@@ -118,17 +119,38 @@ def compute_half_day(work_hours: Optional[float]) -> bool:
     if work_hours is None:
         return False
     return work_hours < 4.50
+def serialize_employee_doc(doc: dict) -> dict:
+    doc.pop("_id", None)
+    created_at = doc.get("created_at")
+    return {
+        "emp_code": doc.get("emp_code"),
+        "name": doc.get("name"),
+        "email": doc.get("email"),
+        "department": doc.get("department"),
+        "shift_start": doc.get("shift_start"),
+        "shift_end": doc.get("shift_end"),
+        "joined_on": doc.get("joined_on"),
+        "created_at": datetime_to_ms(created_at) if isinstance(created_at, datetime) else created_at,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
 class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
-    joined_on: str
+    emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
+    name: str = Field(min_length=1, max_length=100)
+    email: str = Field(max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    department: str = Field(min_length=1, max_length=50)
+    shift_start: str = Field(default="09:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    shift_end: str = Field(default="18:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    joined_on: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
+
+    @model_validator(mode="after")
+    def validate_shifts(self):
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start must differ from shift_end")
+        return self
 
 
 class PunchInIn(BaseModel):
@@ -151,23 +173,33 @@ def health():
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
+    doc["created_at"] = datetime.now(timezone.utc)
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="emp_code already exists")
+    return serialize_employee_doc(doc)
 
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
+def list_employees(
+    department: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
+):
+    if page < 1:
+        raise HTTPException(status_code=422, detail="page must be >= 1")
+    if page_size < 1 or page_size > 100:
+        raise HTTPException(status_code=422, detail="page_size must be between 1 and 100")
+
     q = {}
     if department:
         q["department"] = department
-    skip = page * page_size
-    total = db.employees.count_documents({})
-    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
+    skip = (page - 1) * page_size
+    total = db.employees.count_documents(q)
+    cursor = db.employees.find(q).sort("emp_code", 1).skip(skip).limit(page_size)
+    items = [serialize_employee_doc(d) for d in cursor]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
