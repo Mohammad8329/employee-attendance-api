@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
 from decimal import Decimal, ROUND_HALF_UP # for decial roundup and avoid banker's decimal
+from contextlib import asynccontextmanager
 
 load_dotenv()
 
@@ -25,7 +26,26 @@ db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+def init_db():
+    # employees: unique emp_code
+    db.employees.create_index("emp_code", unique=True)
+    db.employees.create_index([("department", 1), ("joined_on", 1)])
+    # attendance_logs: unique (emp_code, date)
+    db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
+    db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
+    db.attendance_logs.create_index([("status", 1), ("date", 1)])
+    db.attendance_logs.create_index([("date", 1), ("late_minutes", 1)])
+    db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)])
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()  # Runs automatically at startup!
+    yield
+app = FastAPI(
+    title="Employee Attendance & Analytics API",
+    version="2.0.0",
+    lifespan=lifespan,
+)
 
 
 # --------------------------------------------------------------------------- #
